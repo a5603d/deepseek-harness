@@ -546,6 +546,53 @@ export interface DefineToolOptions<S extends ParameterSchemaSpec, O extends Valu
 }
 
 /**
+ * Defensively unwrap stringified structured values on `type: 'json'`
+ * parameters. A json-typed property compiles without a JSON Schema `type`, so
+ * some models emit a structured value as a JSON-encoded string —
+ * `'{"a":1}'` — instead of the object itself. Walking the compiled schema
+ * beside the arguments, wherever a node declares neither `type` nor `oneOf`
+ * (the json compilation shape) and the incoming value is a string whose parse
+ * yields an object or array, that value is replaced with the parsed one.
+ * Scalar parse results and non-JSON strings are preserved verbatim so a
+ * legitimately string-valued json parameter keeps its exact value.
+ * @param schema - compiled parameter JSON Schema.
+ * @param args - candidate arguments as received from the model.
+ * @returns Structurally identical arguments with stringified structured json values unwrapped.
+ */
+export function coerceStringifiedJsonArgs(schema: ParameterJsonSchema, args: unknown): unknown {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
+  const walk = (node: JsonSchemaNode, value: unknown): unknown => {
+    if (node.type === undefined && node.oneOf === undefined) {
+      if (typeof value !== 'string') return value
+      try {
+        const parsed: unknown = JSON.parse(value)
+        if (parsed !== null && typeof parsed === 'object') return parsed
+      } catch { /* a non-JSON string is a legitimate json-typed value */ }
+      return value
+    }
+    if (node.type === 'object' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      const source = value as Record<string, unknown>
+      const result: Record<string, unknown> = { ...source }
+      for (const [key, child] of Object.entries(node.properties ?? {})) {
+        if (key in source) result[key] = walk(child, source[key])
+      }
+      return result
+    }
+    if (node.type === 'array' && Array.isArray(value) && node.items !== undefined) {
+      const itemNode: JsonSchemaNode = node.items
+      return value.map(entry => walk(itemNode, entry))
+    }
+    return value
+  }
+  const source = args as Record<string, unknown>
+  const result: Record<string, unknown> = { ...source }
+  for (const [key, child] of Object.entries(schema.properties)) {
+    if (key in source) result[key] = walk(child, source[key])
+  }
+  return result
+}
+
+/**
  * Define a first-party tool with inferred arguments and strict execution
  * validation. Replay-only presenters validate softly and fall back to generic
  * rendering for obsolete logged arguments.
@@ -577,6 +624,10 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   }
   const parameters = parameterSchemaSpecToJsonSchema(options.parameters)
   const outputSchema = valueSchemaSpecToJsonSchema(options.output.schema)
+  // Some models stringify structured values on json-typed parameters; unwrap
+  // them once here so validation, execution, and soft presenters observe the
+  // same coerced view while logged model arguments stay untouched.
+  const coerce = (args: unknown): unknown => coerceStringifiedJsonArgs(parameters, args)
   const validate = (args: unknown): string[] => validateJsonSchemaValue(parameters, args, '')
   const tool: ToolDefinition = {
     name: options.name,
@@ -596,9 +647,10 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
     ...(options.deferLoading === true ? { deferLoading: options.deferLoading } : {}),
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     async execute(args: unknown, exec: ToolRunContext): Promise<JsonValue> {
-      const violations = validate(args)
+      const coerced = coerce(args)
+      const violations = validate(coerced)
       if (violations.length > 0) throw new ToolArgsError(violations)
-      return userExecute(args as InferArgs<S>, exec) as Promise<JsonValue>
+      return userExecute(coerced as InferArgs<S>, exec) as Promise<JsonValue>
     },
   }
   if (userProjectContent) {
@@ -613,20 +665,23 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   // than the hard `ToolArgsError` the execute path raises.
   if (userPresentCall) {
     tool.presentCall = (args: unknown): ToolCallView | undefined => {
-      if (validate(args).length > 0) return undefined
-      return userPresentCall(args as InferArgs<S>)
+      const coerced = coerce(args)
+      if (validate(coerced).length > 0) return undefined
+      return userPresentCall(coerced as InferArgs<S>)
     }
   }
   if (userPresentResult) {
     tool.presentResult = (args: unknown, result: ToolResult): ToolResultView | undefined => {
-      if (validate(args).length > 0) return undefined
-      return userPresentResult(args as InferArgs<S>, result)
+      const coerced = coerce(args)
+      if (validate(coerced).length > 0) return undefined
+      return userPresentResult(coerced as InferArgs<S>, result)
     }
   }
   if (userIsConcurrencySafe) {
     tool.isConcurrencySafe = (args: unknown): boolean => {
-      if (validate(args).length > 0) return false
-      return userIsConcurrencySafe(args as InferArgs<S>)
+      const coerced = coerce(args)
+      if (validate(coerced).length > 0) return false
+      return userIsConcurrencySafe(coerced as InferArgs<S>)
     }
   }
   return tool

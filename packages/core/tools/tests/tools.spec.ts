@@ -11,7 +11,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import ApprovalService, { type ApprovalOutcome, type ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import ToolRuntime, { defineTool, JsonSchemaError, parameterSchemaSpecToJsonSchema, validateArgs, ToolArgsError, ToolNotFoundError, TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH, type InferArgs, type ParameterSchemaSpec, type PreToolDecision, type PostToolDecision, type JsonSchemaNode, type ToolDefinition, type ToolDispatchExecution, type ToolExecutionResult, type ToolExecutionToken } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { coerceStringifiedJsonArgs, defineTool, JsonSchemaError, parameterSchemaSpecToJsonSchema, validateArgs, ToolArgsError, ToolNotFoundError, TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH, type InferArgs, type ParameterSchemaSpec, type PreToolDecision, type PostToolDecision, type JsonSchemaNode, type ToolDefinition, type ToolDispatchExecution, type ToolExecutionResult, type ToolExecutionToken } from '@deepseek-ai/dsh-tools'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 
@@ -3003,4 +3003,131 @@ it('settles every unowned call when cancellation precedes the batch', async () =
   } finally {
     await ctx.fiber.dispose()
   }
+})
+describe('coerceStringifiedJsonArgs (stringified json-typed parameters)', () => {
+  it('unwraps a stringified object or array on a json-typed property', () => {
+    const spec = { input: { type: 'json' }, mode: { type: 'string' } } satisfies ParameterSchemaSpec
+    const schema = parameterSchemaSpecToJsonSchema(spec)
+    expect(coerceStringifiedJsonArgs(schema, { input: '{"service":"compaction"}', mode: 'list' }))
+      .toEqual({ input: { service: 'compaction' }, mode: 'list' })
+    expect(coerceStringifiedJsonArgs(schema, { input: '[1,{"a":2}]' }))
+      .toEqual({ input: [1, { a: 2 }] })
+    // already-structured values pass through untouched
+    expect(coerceStringifiedJsonArgs(schema, { input: { service: 'compaction' }, mode: 'list' }))
+      .toEqual({ input: { service: 'compaction' }, mode: 'list' })
+  })
+
+  it('keeps scalar parse results, non-JSON strings, and non-string values verbatim', () => {
+    const spec = { input: { type: 'json' } } satisfies ParameterSchemaSpec
+    const schema = parameterSchemaSpecToJsonSchema(spec)
+    // a string that parses to a scalar stays a string — the stringified-then-parsed
+    // round trip must not silently retype legitimately string-valued parameters
+    expect(coerceStringifiedJsonArgs(schema, { input: '"text"' })).toEqual({ input: '"text"' })
+    expect(coerceStringifiedJsonArgs(schema, { input: '123' })).toEqual({ input: '123' })
+    expect(coerceStringifiedJsonArgs(schema, { input: 'null' })).toEqual({ input: 'null' })
+    expect(coerceStringifiedJsonArgs(schema, { input: 'not json' })).toEqual({ input: 'not json' })
+    expect(coerceStringifiedJsonArgs(schema, { input: 5 })).toEqual({ input: 5 })
+    expect(coerceStringifiedJsonArgs(schema, { input: null })).toEqual({ input: null })
+  })
+
+  it('unwraps json values nested inside object properties and array items', () => {
+    const spec = {
+      outer: {
+        type: 'object',
+        additionalProperties: true,
+        required: true,
+        properties: { payload: { type: 'json' } },
+      },
+      list: { type: 'array', items: { type: 'json' } },
+      plain: { type: 'object', additionalProperties: true },
+    } satisfies ParameterSchemaSpec
+    const schema = parameterSchemaSpecToJsonSchema(spec)
+    expect(coerceStringifiedJsonArgs(schema, {
+      outer: { payload: '{"a":1}' },
+      list: ['{"b":2}', 'keep', 3],
+      plain: { untouched: '{"c":3}' },
+    })).toEqual({
+      outer: { payload: { a: 1 } },
+      list: [{ b: 2 }, 'keep', 3],
+      // an undeclared-shape object has no json-typed children to unwrap
+      plain: { untouched: '{"c":3}' },
+    })
+  })
+
+  it('leaves oneOf-typed properties untouched (branch ambiguity)', () => {
+    const spec = {
+      v: { oneOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }] },
+    } satisfies ParameterSchemaSpec
+    const schema = parameterSchemaSpecToJsonSchema(spec)
+    expect(coerceStringifiedJsonArgs(schema, { v: '{"a":1}' })).toEqual({ v: '{"a":1}' })
+  })
+
+  it('returns non-object roots unchanged', () => {
+    const schema = parameterSchemaSpecToJsonSchema({ input: { type: 'json' } })
+    expect(coerceStringifiedJsonArgs(schema, null)).toBeNull()
+    expect(coerceStringifiedJsonArgs(schema, 'nope')).toBe('nope')
+    expect(coerceStringifiedJsonArgs(schema, 7)).toBe(7)
+    expect(coerceStringifiedJsonArgs(schema, ['{"a":1}'])).toEqual(['{"a":1}'])
+  })
+
+  it('defineTool hands execute the unwrapped object for a stringified json parameter', async () => {
+    const ctx = await setup()
+    try {
+      let seen: unknown
+      ctx.tools.register(defineContentToolFixture({
+        name: 'jsonreader',
+        description: 'reads a json input',
+        parameters: { input: { type: 'json' } },
+        async execute(args) {
+          seen = args.input
+          return []
+        },
+      }))
+      const result = await executeToolFixture(ctx, {
+        signal: testToolSignal,
+        callId: ToolCallId('c1'),
+        name: 'jsonreader',
+        arguments: { input: '{"service":"compaction"}' },
+      })
+      expect(result.isError).toBe(false)
+      expect(seen).toEqual({ service: 'compaction' })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('defineTool keeps a legitimately string-valued json parameter and validates declared types strictly', async () => {
+    const ctx = await setup()
+    try {
+      let seen: unknown
+      ctx.tools.register(defineContentToolFixture({
+        name: 'jsonreader',
+        description: 'reads a json input',
+        parameters: { input: { type: 'json' }, path: { type: 'string', required: true } },
+        async execute(args) {
+          seen = args.input
+          return []
+        },
+      }))
+      const kept = await executeToolFixture(ctx, {
+        signal: testToolSignal,
+        callId: ToolCallId('c1'),
+        name: 'jsonreader',
+        arguments: { input: 'plain text', path: '/x' },
+      })
+      expect(kept.isError).toBe(false)
+      expect(seen).toBe('plain text')
+      // declared non-json types still reject mismatches after coercion
+      const rejected = await executeToolFixture(ctx, {
+        signal: testToolSignal,
+        callId: ToolCallId('c2'),
+        name: 'jsonreader',
+        arguments: { input: '{"a":1}', path: 5 },
+      })
+      expect(rejected.isError).toBe(true)
+      expect(rejected.error?.message).toContain('"path" must be a string')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
 })
